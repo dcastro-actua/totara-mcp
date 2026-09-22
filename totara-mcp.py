@@ -25,6 +25,9 @@ load_dotenv()
 
 mcp = FastMCP("totara")
 
+TOTARA_URL = os.environ.get("TOTARA_URL", "http://localhost:8080").rstrip("/")
+TOTARA_WS_TOKEN = os.environ.get("TOTARA_WS_TOKEN", "")
+
 PROD_SSH_HOST = os.environ.get("PROD_SSH_HOST", "")
 PROD_SSH_PORT = int(os.environ.get("PROD_SSH_PORT", "222"))
 PROD_SSH_USER = os.environ.get("PROD_SSH_USER", "")
@@ -105,6 +108,62 @@ async def execute_command_docker(cmd: str) -> str:
     )
 
     return result.stdout
+
+
+def _flatten_ws_params(value, prefix=""):
+    items = {}
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            next_prefix = f"{prefix}[{key}]" if prefix else str(key)
+            items.update(_flatten_ws_params(nested, next_prefix))
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            items.update(_flatten_ws_params(nested, f"{prefix}[{index}]"))
+    elif isinstance(value, bool):
+        items[prefix] = 1 if value else 0
+    elif value is not None:
+        items[prefix] = value
+    return items
+
+
+def _webservice_error_message(payload: dict) -> str:
+    message = payload.get("message") or payload.get("error") or "Totara web service error"
+    errorcode = payload.get("errorcode")
+    debuginfo = payload.get("debuginfo")
+    parts = [message]
+    if errorcode:
+        parts.append(f"[{errorcode}]")
+    if debuginfo:
+        parts.append(f"({debuginfo})")
+    return " ".join(parts)
+
+
+async def call_webservice(wsfunction: str, params: dict | None = None):
+    if not TOTARA_WS_TOKEN:
+        raise ValueError("Set TOTARA_WS_TOKEN in .env before calling Totara web services")
+
+    data = {
+        "wstoken": TOTARA_WS_TOKEN,
+        "wsfunction": wsfunction,
+        "moodlewsrestformat": "json",
+        **_flatten_ws_params(params or {}),
+    }
+    url = f"{TOTARA_URL}/webservice/rest/server.php"
+
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        response = await client.post(url, data=data)
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        response.raise_for_status()
+        raise ValueError(f"Unexpected Totara response: {response.text[:500]}") from exc
+
+    if isinstance(payload, dict) and (payload.get("exception") or payload.get("error")):
+        raise ValueError(_webservice_error_message(payload))
+
+    response.raise_for_status()
+    return payload
 
 
 @mcp.tool()
@@ -200,6 +259,41 @@ async def queryProduction(sqlQuery: str, database: str):
 async def compileGrunt():
     """Compiles css and javascript with grunt cli"""
     return await execute_command_docker("grunt --force")
+
+
+@mcp.tool()
+async def createCourse(
+    fullname: str,
+    shortname: str,
+    categoryid: int = 1,
+    summary: str = "",
+    courseFormat: str = "",
+    visible: int | None = None,
+    idnumber: str = "",
+    enablecompletion: int | None = None,
+    startdate: int | None = None,
+):
+    """Create a course on the Totara site via core_course_create_courses. Uses TOTARA_URL (default http://localhost:8080) and TOTARA_WS_TOKEN from .env."""
+    course = {
+        "fullname": fullname,
+        "shortname": shortname,
+        "categoryid": categoryid,
+    }
+    if summary:
+        course["summary"] = summary
+    if courseFormat:
+        course["format"] = courseFormat
+    if visible is not None:
+        course["visible"] = visible
+    if idnumber:
+        course["idnumber"] = idnumber
+    if enablecompletion is not None:
+        course["enablecompletion"] = enablecompletion
+    if startdate is not None:
+        course["startdate"] = startdate
+
+    created = await call_webservice("core_course_create_courses", {"courses": [course]})
+    return created[0] if isinstance(created, list) and created else created
 
 
 def _sanitize_admin_cli_script(script: str) -> str:
